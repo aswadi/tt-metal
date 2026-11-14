@@ -17,14 +17,20 @@ void kernel_main() {
     // can amortize the noc reads by doing them side by side for the two tensors
     constexpr uint32_t onetile = 1;
 
-    // Reduce ops need to multiply by a scalar. We always want to multiply by 1.0f
-    dataflow_kernel_lib::
-        calculate_and_prepare_reduce_scaler<dfb::scale, ckernel::PoolType::SUM, ckernel::ReduceDim::REDUCE_ROW>();
-
     const auto interleaved_accessor0 = TensorAccessor(tensor::output);
 
     const Noc noc;
+    DataflowBuffer dfb_scaler_max(dfb::scaler_max);
+    DataflowBuffer dfb_scaler_sum(dfb::scaler_sum);
     DataflowBuffer dfb_out(dfb::out);
+
+    // Reduce ops need to multiply by a scalar. Prepare separate MAX and SUM scaler tiles.
+    dataflow_kernel_lib::
+        calculate_and_prepare_reduce_scaler<dfb::scaler_max, ckernel::PoolType::MAX, ckernel::ReduceDim::REDUCE_ROW>(
+            dfb_scaler_max);
+    dataflow_kernel_lib::
+        calculate_and_prepare_reduce_scaler<dfb::scaler_sum, ckernel::PoolType::SUM, ckernel::ReduceDim::REDUCE_ROW>(
+            dfb_scaler_sum);
 
     const uint32_t tile_bytes = dfb_out.get_tile_size();
 

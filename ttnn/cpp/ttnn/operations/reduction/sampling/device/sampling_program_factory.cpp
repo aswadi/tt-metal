@@ -242,7 +242,11 @@ ttnn::device_operation::ProgramArtifacts SamplingProgramFactory::create_program_
             aligned_final_indices_rm_unit_size,
             Ht * tile_height,
             input_indices_dfb_data_format),
-        make_dfb(SAMPLING_TEMP, temp_chunk_size, 1, temp_dfb_data_format),
+        make_dfb(
+            SAMPLING_TEMP,
+            std::max(temp_chunk_size, tile_size(temp_dfb_data_format)),
+            1,
+            temp_dfb_data_format),
     };
 
     // The reader is created once over every running core: it streams in the value and index tiles the

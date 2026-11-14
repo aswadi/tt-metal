@@ -43,8 +43,20 @@ void MoeDeviceOperation::validate_on_program_cache_miss(
         "Input height (combined input_shape[0-2]) {} must be a multiple of 32",
         input_shape[0] * input_shape[1] * input_shape[2]);
 
-    TT_FATAL(args.output_memory_config.is_sharded() == false, "Sharded implementation not supported yet");
-    TT_FATAL(input_tensor.layout() == Layout::TILE, "The input must be in tiled format");
+    TT_FATAL(
+        !args.output_memory_config.is_sharded() && !input_tensor.memory_config().is_sharded() &&
+            !expert_mask_tensor.memory_config().is_sharded() && !topk_mask_tensor.memory_config().is_sharded(),
+        "Sharded implementation not supported yet");
+    TT_FATAL(
+        input_tensor.layout() == Layout::TILE && expert_mask_tensor.layout() == Layout::TILE &&
+            topk_mask_tensor.layout() == Layout::TILE,
+        "input, expert_mask and topk_mask must be in TILE layout");
+    if (tensor_args.preallocated_output.has_value()) {
+        const auto& preallocated_out = tensor_args.preallocated_output.value();
+        TT_FATAL(!preallocated_out.memory_config().is_sharded(), "Sharded preallocated_output is not supported");
+        TT_FATAL(preallocated_out.layout() == Layout::TILE, "preallocated_output must be in TILE layout");
+        TT_FATAL(preallocated_out.dtype() == DataType::BFLOAT16, "preallocated_output must be BFLOAT16");
+    }
     // The compute kernel unpacks every input as bfloat16; any other dtype hangs the device.
     TT_FATAL(
         input_tensor.dtype() == DataType::BFLOAT16 && expert_mask_tensor.dtype() == DataType::BFLOAT16 &&

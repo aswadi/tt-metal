@@ -43,7 +43,8 @@ const TensorParamName MOE_TENSOR_OUTPUT{"output"};
 const DFBSpecName MOE_DFB_INPUT{"input"};
 const DFBSpecName MOE_DFB_EXPERT_MASK{"expert_mask"};
 const DFBSpecName MOE_DFB_TOPK_MASK{"topk_mask"};
-const DFBSpecName MOE_DFB_SCALE{"scale"};
+const DFBSpecName MOE_DFB_SCALER_MAX{"scaler_max"};
+const DFBSpecName MOE_DFB_SCALER_SUM{"scaler_sum"};
 const DFBSpecName MOE_DFB_INDEX{"index"};
 const DFBSpecName MOE_DFB_INPUT_TRANSPOSED{"input_transposed"};
 const DFBSpecName MOE_DFB_INDEX_TRANSPOSED{"index_transposed"};
@@ -130,9 +131,15 @@ ttnn::device_operation::ProgramArtifacts MoeProgramFactory::create_program_artif
         .data_format_metadata = topk_mask_dfb_data_format,
     });
 
-    // identity scale input
+    // Reduce scalers: separate buffers for MAX and SUM reductions
     dataflow_buffers.push_back(DataflowBufferSpec{
-        .unique_id = MOE_DFB_SCALE,
+        .unique_id = MOE_DFB_SCALER_MAX,
+        .entry_size = scalar_tile_size,
+        .num_entries = scale_tiles,
+        .data_format_metadata = scalar_df,
+    });
+    dataflow_buffers.push_back(DataflowBufferSpec{
+        .unique_id = MOE_DFB_SCALER_SUM,
         .entry_size = scalar_tile_size,
         .num_entries = scale_tiles,
         .data_format_metadata = scalar_df,
@@ -260,11 +267,16 @@ ttnn::device_operation::ProgramArtifacts MoeProgramFactory::create_program_artif
                     .accessor_name = "out",
                     .endpoint_type = DFBEndpointType::CONSUMER,
                 },
-                // The writer also fills the identity scale buffer that the compute kernel's reduce
-                // steps multiply by, so it is that buffer's producer as well as the output's consumer.
+                // The writer also fills the identity scale buffers that the compute kernel's reduce
+                // steps multiply by, so it is those buffers' producer as well as the output's consumer.
                 DFBBinding{
-                    .dfb_spec_name = MOE_DFB_SCALE,
-                    .accessor_name = "scale",
+                    .dfb_spec_name = MOE_DFB_SCALER_MAX,
+                    .accessor_name = "scaler_max",
+                    .endpoint_type = DFBEndpointType::PRODUCER,
+                },
+                DFBBinding{
+                    .dfb_spec_name = MOE_DFB_SCALER_SUM,
+                    .accessor_name = "scaler_sum",
                     .endpoint_type = DFBEndpointType::PRODUCER,
                 },
             },
@@ -293,8 +305,13 @@ ttnn::device_operation::ProgramArtifacts MoeProgramFactory::create_program_artif
             .endpoint_type = DFBEndpointType::CONSUMER,
         },
         DFBBinding{
-            .dfb_spec_name = MOE_DFB_SCALE,
-            .accessor_name = "scale",
+            .dfb_spec_name = MOE_DFB_SCALER_MAX,
+            .accessor_name = "scaler_max",
+            .endpoint_type = DFBEndpointType::CONSUMER,
+        },
+        DFBBinding{
+            .dfb_spec_name = MOE_DFB_SCALER_SUM,
+            .accessor_name = "scaler_sum",
             .endpoint_type = DFBEndpointType::CONSUMER,
         },
         DFBBinding{

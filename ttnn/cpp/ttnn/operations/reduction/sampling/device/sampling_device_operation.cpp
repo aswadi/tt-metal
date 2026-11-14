@@ -77,8 +77,8 @@ void SamplingDeviceOperation::validate_on_program_cache_miss(
         "Sampling currently supports between 1 and 32 users (one core per user); got {}!",
         num_users);
     TT_FATAL(
-        input_shape[3] != 0 && input_shape[3] % 32 == 0,
-        "Input inner dim ({}) must be non-zero and divisible by 32, pad if needed!",
+        input_shape[3] >= 64 && input_shape[3] % 32 == 0,
+        "Input inner dim ({}) must be at least 64 and divisible by 32, pad if needed!",
         input_shape[3]);
     // The top-k stage processes the W/32 candidate tiles with a pairwise local sort followed by a
     // bitonic merge tree whose schedule assumes a power-of-2 tile count. A non-power-of-2 Wt hangs
@@ -121,6 +121,9 @@ void SamplingDeviceOperation::validate_on_program_cache_miss(
         TT_FATAL(
             preallocated_output_tensor.value().memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED,
             "Only INTERLEAVED memory layout is supported for outputs!");
+        TT_FATAL(
+            preallocated_output_tensor.value().layout() == Layout::ROW_MAJOR,
+            "Only ROW_MAJOR layout is supported for outputs!");
 
         const auto& sampling_pre_out = preallocated_output_tensor.value();
         const auto& sampling_pre_out_shape = sampling_pre_out.logical_shape();
@@ -152,6 +155,11 @@ void SamplingDeviceOperation::validate_on_program_cache_miss(
     TT_FATAL(k.layout() == Layout::ROW_MAJOR, "Only ROW_MAJOR layout is supported for k!");
     TT_FATAL(p.layout() == Layout::ROW_MAJOR, "Only ROW_MAJOR layout is supported for p!");
     TT_FATAL(temp.layout() == Layout::ROW_MAJOR, "Only ROW_MAJOR layout is supported for temp!");
+    TT_FATAL(
+        k.memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED &&
+            p.memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED &&
+            temp.memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED,
+        "Only INTERLEAVED memory layout is supported for k, p, and temp!");
     // k/p/temp carry one entry per user, so they must match num_users (== N*C*H). Only num_users
     // cores run and each reads its own entry, so no padding to 32 is required.
     TT_FATAL(k.logical_shape() == Shape({num_users}), "k must have shape [{}] (one per user)!", num_users);

@@ -12,9 +12,7 @@
 #include "api/scratchpad.h"
 #include "api/tensor/noc_traits.h"
 #include "experimental/kernel_args.h"
-#include "ttnn/cpp/ttnn/operations/transformer/sdpa_decode/device/kernels/dataflow/dataflow_common.hpp"
 #include "ttnn/cpp/ttnn/kernel_lib/reduce_helpers_dataflow.hpp"
-#include "ttnn/kernel/dataflow/generate_bcast_scalar_metal2.hpp"
 /* This kernel does:
 Top-p Cumulative Probability Filtering:
 Iteratively accumulates probabilities, comparing them against the nucleus threshold p to determine the smallest set of
@@ -37,6 +35,33 @@ FORCE_INLINE float bf16_to_f32(uint16_t bf16) {
     return result;
 }
 
+template <typename DFB>
+FORCE_INLINE void generate_topk_mask_tile(DFB& dfb_mask, const Noc& noc, uint32_t k) {
+    constexpr uint16_t NEG_INF_BF16 = 0xFF80;
+    const uint32_t tile_bytes = dfb_mask.get_entry_size();
+    const uint32_t num_faces = (tile_bytes == 1024) ? 2 : 4;
+
+    dfb_mask.reserve_back(1);
+    noc.async_write_zeros(dfb_mask, tile_bytes, {.offset_bytes = 0});
+    noc.write_zeros_l1_barrier();
+
+    if (k < 32) {
+        auto lock = dfb_mask.scoped_write_lock(1);
+        volatile uint16_t* u16_ptr = lock.template get_ptr<volatile uint16_t>();
+        for (uint32_t face_row_pair = 0; face_row_pair < num_faces; face_row_pair += 2) {
+            for (uint32_t r = 0; r < FACE_HEIGHT; ++r) {
+                for (uint32_t col = k; col < 32; ++col) {
+                    const uint32_t face_idx = face_row_pair + (col >> 4);
+                    const uint32_t col_in_face = col & (FACE_WIDTH - 1);
+                    u16_ptr[(face_idx << 8) + r * FACE_WIDTH + col_in_face] = NEG_INF_BF16;
+                }
+            }
+        }
+    }
+
+    dfb_mask.push_back(1);
+}
+
 void kernel_main() {
     constexpr auto final_indices_stick_size = get_arg(args::final_indices_stick_size);
     // The host also supplies out_stick_size; this kernel does not read it.
@@ -53,21 +78,27 @@ void kernel_main() {
     constexpr uint32_t p_chunk_size = num_cores * sizeof(uint16_t);     // 2 bytes per uint16_t
     constexpr uint32_t temp_chunk_size = num_cores * sizeof(uint16_t);  // 2 bytes per uint16_t
     constexpr uint32_t out_chunk_size = num_cores * sizeof(uint32_t);   // 4 bytes per uint32_t
-    dataflow_kernel_lib::
-        calculate_and_prepare_reduce_scaler<dfb::scaler_max, ckernel::PoolType::MAX, ckernel::ReduceDim::REDUCE_ROW>();
-    dataflow_kernel_lib::
-        calculate_and_prepare_reduce_scaler<dfb::scaler_sum, ckernel::PoolType::SUM, ckernel::ReduceDim::REDUCE_ROW>();
-    // read k, p, temp
 
     const Noc noc;
     const Scratchpad<volatile uint32_t> k_chunk(scratch::k);
     const Scratchpad<volatile uint16_t> p_chunk(scratch::p);
+    DataflowBuffer dfb_scaler_max(dfb::scaler_max);
+    DataflowBuffer dfb_scaler_sum(dfb::scaler_sum);
+    DataflowBuffer dfb_mask(dfb::mask);
     DataflowBuffer dfb_temp(dfb::temp);
     DataflowBuffer dfb_rand(dfb::rand);
     DataflowBuffer dfb_final_indices(dfb::final_indices);
     DataflowBuffer dfb_local_values(dfb::local_values);
     DataflowBuffer dfb_local_indices(dfb::local_indices);
     const Scratchpad<volatile uint32_t> index_out(scratch::out);
+
+    dataflow_kernel_lib::
+        calculate_and_prepare_reduce_scaler<dfb::scaler_max, ckernel::PoolType::MAX, ckernel::ReduceDim::REDUCE_ROW>(
+            dfb_scaler_max);
+    dataflow_kernel_lib::
+        calculate_and_prepare_reduce_scaler<dfb::scaler_sum, ckernel::PoolType::SUM, ckernel::ReduceDim::REDUCE_ROW>(
+            dfb_scaler_sum);
+    // read k, p, temp
 
     const auto addrg_k = TensorAccessor(tensor::k);
     // Read the entire aligned chunk to avoid NOC alignment issues
@@ -78,6 +109,13 @@ void kernel_main() {
     {
         const auto k_lock = k_chunk.scoped_lock(core_id, 1);
         k = k_chunk[core_id];
+    }
+    // Clamp runtime k to the valid single-tile top-k domain [1, 32] so k == 0 cannot underflow k - 1
+    // or divide by zero, and k > 32 cannot wrap modulo 32 or read past this user's face row bounds.
+    if (k < 1) {
+        k = 1;
+    } else if (k > 32) {
+        k = 32;
     }
 
     const auto addrg_p = TensorAccessor(tensor::p);
@@ -92,21 +130,21 @@ void kernel_main() {
     }
 
     const auto addrg_temp = TensorAccessor(tensor::temp);
-    // dfb_temp.reserve_back(1);
-    const uint32_t dfb_temp_ptr = dfb_temp.get_write_ptr();
+    dfb_temp.reserve_back(1);
     // Read the entire aligned chunk to avoid NOC alignment issues
     noc.async_read(addrg_temp, dfb_temp, temp_chunk_size, {.page_id = 0}, {.offset_bytes = 0});
     noc.async_read_barrier();
-    // dfb_temp.push_back(1);
+    {
+        auto temp_lock = dfb_temp.scoped_write_lock(1);
+        volatile uint16_t* temp_u16 = temp_lock.template get_ptr<volatile uint16_t>();
+        const uint16_t temp = temp_u16[core_id];
+        volatile uint32_t* temp_u32 = temp_lock.template get_ptr<volatile uint32_t>();
+        temp_u32[0] = static_cast<uint32_t>(temp);
+    }
+    dfb_temp.push_back(1);
 
-    const CoreLocalMem<volatile uint16_t> temp_ptr(dfb_temp_ptr);
-    // Index into the chunk to get this core's value
-    const uint16_t temp = temp_ptr[core_id];
-    const uint32_t temp_packed = (static_cast<uint32_t>(temp) << 16) + static_cast<uint32_t>(temp);
-    generate_bcast_unary_scalar(dfb_temp, temp_packed);
     // generate the top-k mask
-    constexpr uint32_t one = 1;
-    generate_mask<dfb::mask, one>(one, ids_per_batch / 32, k - 1);
+    generate_topk_mask_tile(dfb_mask, noc, k);
     // get random number
     dfb_rand.wait_front(1);
     const CoreLocalMem<volatile uint16_t> rand_values(dfb_rand.get_read_ptr());
